@@ -33,10 +33,11 @@ function main() {
 }
 
 // Reads the enabled responsive search ads. AdsApp.search returns one row per ad.
-function readAds() {
+function readAds(maxAds) {
+  var limit = typeof maxAds === 'number' ? Math.min(CAPS.ads, maxAds) : CAPS.ads;
   var rows = AdsApp.search(QUERY);
   var ads = [];
-  while (rows.hasNext() && ads.length < CAPS.ads) {
+  while (rows.hasNext() && ads.length < limit) {
     var row = rows.next();
     var ad = row.adGroupAd.ad;
     var rsa = ad.responsiveSearchAd || {};
@@ -60,29 +61,60 @@ function assetText(asset) {
 
 // Checks each ad against its final URL. The same URL is fetched once, and a
 // URL past the cap is not fetched. The fetch argument lets a test pass fixtures.
-function checkAds(ads, fetch) {
-  var pages = {};
-  var distinct = 0;
+// The manager script passes one budget across accounts, so the URL and time
+// caps cover the whole run. A single-account call keeps its own cache.
+function checkAds(ads, fetch, budget) {
+  budget = budget || {};
+  var pages = budget.pages || {};
+  budget.pages = pages;
+  var distinct = budget.distinct || 0;
+  var maxUrls = budget.maxUrls || CAPS.urls;
+  var deadline = budget.deadline || 0;
   var notChecked = 0;
+  var stopped = false;
+  var urlCapped = false;
   var rows = [];
   for (var i = 0; i < ads.length; i++) {
+    if (deadline && currentMillis() >= deadline) {
+      notChecked += ads.length - i;
+      stopped = true;
+      break;
+    }
     var ad = ads[i];
     if (!ad.finalUrl) {
       rows.push({ ad: ad, lines: adLines(ad), problems: ['No final URL is set on this ad.'] });
       continue;
     }
     if (!pages[ad.finalUrl]) {
-      if (distinct >= CAPS.urls) {
+      if (distinct >= maxUrls) {
         notChecked++;
+        urlCapped = true;
         continue;
       }
       distinct++;
-      pages[ad.finalUrl] = visitUrl(ad.finalUrl, fetch);
+      var visited = visitUrl(ad.finalUrl, fetch, deadline);
+      if (visited.timedOut) {
+        notChecked += ads.length - i;
+        stopped = true;
+        break;
+      }
+      pages[ad.finalUrl] = visited;
     }
     var row = problemsFor(ad, pages[ad.finalUrl]);
     if (row.problems.length > 0) rows.push(row);
   }
-  return { checked: ads.length - notChecked, notChecked: notChecked, rows: rows };
+  budget.distinct = distinct;
+  return {
+    checked: ads.length - notChecked,
+    notChecked: notChecked,
+    rows: rows,
+    stopped: stopped,
+    urlCapped: urlCapped
+  };
+}
+
+function currentMillis() {
+  return new Date().getTime();
 }
 
 // The headline and description lines of an ad, in Google's order.
@@ -94,14 +126,16 @@ function adLines(ad) {
 
 // Fetches one final URL with the tracking probe added. It records the hops,
 // the final status, the page body, and each probe parameter the walk dropped.
-function visitUrl(url, fetch) {
-  var walk = walkUrl(addQuery(url, TRACKING_PROBE.join('&')), fetch);
+function visitUrl(url, fetch, deadline) {
+  var walk = walkUrl(addQuery(url, TRACKING_PROBE.join('&')), fetch, deadline);
+  if (walk.timedOut) return { timedOut: true };
   var lost = TRACKING_PROBE.filter(function (pair) {
     return walk.finalUrl.indexOf(pair) < 0;
   }).map(function (pair) {
     return pair.split('=')[0];
   });
   return {
+    timedOut: false,
     hops: walk.hops,
     status: walk.status,
     tooManyRedirects: walk.tooManyRedirects,
@@ -112,13 +146,19 @@ function visitUrl(url, fetch) {
 
 // Follows redirects by hand. A redirect that the script does not follow is a
 // problem, so the walk stops after CAPS.redirects hops.
-function walkUrl(startUrl, fetch) {
+function walkUrl(startUrl, fetch, deadline) {
   var hops = [];
   var url = startUrl;
+  if (deadline && currentMillis() >= deadline) {
+    return { hops: hops, finalUrl: url, status: 0, tooManyRedirects: false, timedOut: true, body: '' };
+  }
   var response = fetch(url);
   while (response.code >= 300 && response.code < 400 && response.location) {
+    if (deadline && currentMillis() >= deadline) {
+      return { hops: hops, finalUrl: url, status: response.code, tooManyRedirects: false, timedOut: true, body: '' };
+    }
     if (hops.length >= CAPS.redirects) {
-      return { hops: hops, finalUrl: url, status: response.code, tooManyRedirects: true, body: '' };
+      return { hops: hops, finalUrl: url, status: response.code, tooManyRedirects: true, timedOut: false, body: '' };
     }
     hops.push({ url: url, code: response.code });
     url = resolveUrl(url, response.location);
@@ -129,6 +169,7 @@ function walkUrl(startUrl, fetch) {
     finalUrl: url,
     status: response.code,
     tooManyRedirects: false,
+    timedOut: false,
     body: response.body || ''
   };
 }
